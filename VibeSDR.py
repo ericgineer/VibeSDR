@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QRadioButton, QButtonGroup, QSlider, QComboBox,
     QPushButton, QFileDialog, QButtonGroup, QGroupBox, QFormLayout,
-    QSpinBox, QDial
+    QSpinBox, QDial, QProgressBar
 )
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
@@ -523,6 +523,7 @@ class SDRProcessor(QObject):
     
     waterfall_updated = pyqtSignal(np.ndarray)
     audio_level_updated = pyqtSignal(float)
+    s_meter_updated = pyqtSignal(float)
 
     def __init__(self, config: SDRConfig):
         super().__init__()
@@ -596,6 +597,11 @@ class SDRProcessor(QObject):
                 # Emit audio level for display
                 level = np.sqrt(np.mean(audio ** 2))
                 self.audio_level_updated.emit(level)
+
+                # Emit S-meter level from I/Q power
+                iq_power = np.mean(np.abs(iq_samples) ** 2)
+                iq_db = 10.0 * np.log10(iq_power + 1e-12)
+                self.s_meter_updated.emit(iq_db)
 
                 # Small sleep to prevent 100% CPU
                 threading.Event().wait(0.001)
@@ -673,6 +679,14 @@ class VibeSDRGUI(QMainWindow):
         self.iq_source = None
         self.available_devices = []
         self.csv_device_index = None
+
+        # S-meter smoothing & calibration state
+        self.s_meter_smoothed = -127.0
+        self.s_meter_baseline = None
+        self.s_meter_calibration_samples = []
+        self.s_meter_auto_calibrated = False
+        self.s_meter_mode = "Both"
+
         self._populate_available_devices()
 
         self.setWindowTitle("VibeSDR - Software Defined Radio")
@@ -694,6 +708,7 @@ class VibeSDRGUI(QMainWindow):
         self.setCentralWidget(main_widget)
 
         self.show()
+        print("VibeSDR GUI initialized and shown")
 
     def _populate_available_devices(self):
         """Populate list of available audio input devices"""
@@ -823,6 +838,27 @@ class VibeSDRGUI(QMainWindow):
         level_group.setLayout(level_layout)
         layout.addWidget(level_group)
 
+        # S-meter indicator
+        s_meter_group = QGroupBox("S-meter")
+        s_meter_layout = QVBoxLayout()
+        self.s_meter_label = QLabel("S-meter: -- dB")
+        self.s_meter_bar = QProgressBar()
+        self.s_meter_bar.setMinimum(0)
+        self.s_meter_bar.setMaximum(100)
+        self.s_meter_bar.setValue(0)
+        self.s_meter_bar.setTextVisible(False)
+
+        self.s_meter_mode_combo = QComboBox()
+        self.s_meter_mode_combo.addItems(["Both", "dB", "S-units"])
+        self.s_meter_mode_combo.currentTextChanged.connect(self._on_s_meter_mode_changed)
+
+        s_meter_layout.addWidget(self.s_meter_label)
+        s_meter_layout.addWidget(self.s_meter_bar)
+        s_meter_layout.addWidget(QLabel("Mode:"))
+        s_meter_layout.addWidget(self.s_meter_mode_combo)
+        s_meter_group.setLayout(s_meter_layout)
+        layout.addWidget(s_meter_group)
+
         layout.addStretch()
         panel.setLayout(layout)
         return panel
@@ -881,6 +917,10 @@ class VibeSDRGUI(QMainWindow):
         if self.processor:
             self.processor.set_volume(volume)
 
+    def _on_s_meter_mode_changed(self, mode: str):
+        """Handle S-meter display mode changes"""
+        self.s_meter_mode = mode
+
     def _on_start(self):
         """Start SDR processing"""
         if self.processor and self.processor.running:
@@ -902,11 +942,18 @@ class VibeSDRGUI(QMainWindow):
             self.iq_source = AudioCardIQSource(self.config.sample_rate, device=device_index)
             print(f"Using audio device {device_index} as I/Q source")
 
+        # Reset S-meter calibration on start
+        self.s_meter_smoothed = -127.0
+        self.s_meter_baseline = None
+        self.s_meter_calibration_samples = []
+        self.s_meter_auto_calibrated = False
+
         # Create processor
         self.processor = SDRProcessor(self.config)
         self.processor.set_iq_source(self.iq_source)
         self.processor.waterfall_updated.connect(self._on_waterfall_update)
         self.processor.audio_level_updated.connect(self._on_level_update)
+        self.processor.s_meter_updated.connect(self._on_s_meter_update)
 
         # Start in thread
         self.processor_thread = QThread()
@@ -944,6 +991,52 @@ class VibeSDRGUI(QMainWindow):
         """Update audio level display"""
         level_db = 20 * np.log10(level + 1e-10) if level > 0 else -100
         self.level_label.setText(f"Level: {level_db:.1f} dB")
+
+    def _on_s_meter_update(self, iq_db: float):
+        """Update S-meter display"""
+        # Smoothing (attack/release) to reduce jitter
+        alpha = 0.25
+        self.s_meter_smoothed = alpha * iq_db + (1.0 - alpha) * self.s_meter_smoothed
+
+        # Auto-calibration in first 100 samples using background-noise floor
+        if not self.s_meter_auto_calibrated:
+            self.s_meter_calibration_samples.append(self.s_meter_smoothed)
+            if len(self.s_meter_calibration_samples) >= 100:
+                self.s_meter_baseline = np.mean(self.s_meter_calibration_samples)
+                self.s_meter_auto_calibrated = True
+            calibrated_db = self.s_meter_smoothed
+        else:
+            calibrated_db = self.s_meter_smoothed - self.s_meter_baseline
+
+        # Ham-standard mapping
+        # S0 = -127 dB, S9 = -73 dB, S9+20 = -53 dB
+        db_for_bar = np.clip(calibrated_db, -127.0, -53.0)
+        bar_value = np.clip((db_for_bar + 127.0) / 74.0 * 100.0, 0, 100)
+        self.s_meter_bar.setValue(int(bar_value))
+
+        # Color bands style
+        self.s_meter_bar.setStyleSheet(
+            "QProgressBar::chunk {background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            " stop:0 green, stop:0.6 yellow, stop:1 red;}"
+        )
+
+        if calibrated_db <= -127.0:
+            s_label = "S0"
+        elif calibrated_db < -73.0:
+            s_unit = np.clip(1.0 + (calibrated_db + 121.0) / 6.0, 0.0, 8.9999)
+            s_label = f"S{int(np.floor(s_unit))}"
+        else:
+            over = min(20.0, calibrated_db + 73.0)
+            s_label = f"S9+{over:.1f} dB"
+
+        if self.s_meter_mode == "dB":
+            display_text = f"S-meter: {calibrated_db:.1f} dB"
+        elif self.s_meter_mode == "S-units":
+            display_text = f"S-meter: {s_label}"
+        else:
+            display_text = f"S-meter: {calibrated_db:.1f} dB ({s_label})"
+
+        self.s_meter_label.setText(display_text)
 
     def closeEvent(self, event):
         """Clean up on window close"""
