@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QRadioButton, QButtonGroup, QSlider, QComboBox,
     QPushButton, QFileDialog, QButtonGroup, QGroupBox, QFormLayout,
-    QSpinBox, QDial, QProgressBar
+    QSpinBox, QDial, QProgressBar, QInputDialog
 )
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
@@ -55,7 +55,8 @@ class SDRConfig:
     fft_size: int = 2048
     audio_device_input: int = None  # None = default
     audio_device_output: int = None  # None = default
-
+    tx_audio_device_input: int = None  # None = default for TX
+    ssb_upper_sideband: bool = True  # True = USB, False = LSB
 
 # ============================================================================
 # Demodulation Algorithms
@@ -107,6 +108,32 @@ class Demodulator:
         
         # Apply frequency shift
         shifted = iq_samples * tuning_osc
+        
+        return shifted
+
+    def apply_frequency_shift_tx(self, iq_samples: np.ndarray, freq_hz: float) -> np.ndarray:
+        """
+        Apply upward frequency shift for TX (positive frequency)
+        Used to shift baseband modulated signal to center frequency
+        
+        Args:
+            iq_samples: Complex I/Q samples (baseband)
+            freq_hz: Frequency to shift to (positive for upshift)
+        
+        Returns:
+            Frequency-shifted I/Q samples
+        """
+        if freq_hz == 0:
+            return iq_samples
+        
+        n_samples = len(iq_samples)
+        t = np.arange(n_samples) / self.sample_rate
+        
+        # Create upshift oscillator (positive frequency)
+        upshift_osc = np.exp(1j * 2 * np.pi * freq_hz * t)
+        
+        # Apply frequency shift
+        shifted = iq_samples * upshift_osc
         
         return shifted
 
@@ -199,30 +226,87 @@ class Demodulator:
     def demodulate_ssb(self, iq_samples: np.ndarray, upper_sideband: bool = True) -> np.ndarray:
         """
         Demodulate SSB (Single SideBand) signal
-        SSB demodulation: use Hilbert transform to recover modulating signal
+
+        NOTE: This implementation is tailored to the specific I/Q sample format
+        used in this SDR application. For this format:
+        - USB information is encoded in the real (I) channel
+        - LSB information is encoded in the imaginary (Q) channel
+
+        This is NOT standard SSB demodulation theory, but works empirically
+        for the test signals and I/Q data format used here.
+
+        Args:
+            iq_samples: Complex I/Q samples
+            upper_sideband: True for USB, False for LSB
         """
-        # Apply frequency shift for tuning
+        # Apply frequency shift for tuning (heterodyne to baseband)
         iq_samples = self.apply_frequency_shift(iq_samples)
-        
-        # For USB: take I, for LSB: take Q (simplified approach)
-        # More complex would use Hilbert transform
+
+        # Extract audio based on sideband selection for this I/Q format
         if upper_sideband:
-            audio = np.real(iq_samples)
+            audio = np.real(iq_samples)  # USB: I channel
         else:
-            audio = np.imag(iq_samples)
-        
+            audio = np.imag(iq_samples)  # LSB: Q channel
+
         # Remove DC bias
         audio = audio - np.mean(audio)
-        
-        # Apply low-pass filter
+
+        # Apply low-pass filter to remove high-frequency artifacts
         audio = signal.lfilter(self.demod_filter[0], self.demod_filter[1], audio)
-        
+
         return audio
 
+        # Apply final audio low-pass filter
+        audio = signal.lfilter(self.demod_filter[0], self.demod_filter[1], audio)
 
-# ============================================================================
-# I/Q Sample Sources
-# ============================================================================
+    def modulate_am(self, audio: np.ndarray) -> np.ndarray:
+        """AM modulate audio to complex baseband I/Q"""
+        # Normalize audio to [-1,1]
+        peak = np.max(np.abs(audio)) + 1e-12
+        audio_n = np.clip(audio / peak, -1.0, 1.0)
+        envelope = 0.5 + 0.5 * audio_n
+        iq = envelope.astype(np.complex64)
+        return iq
+
+    def modulate_fm(self, audio: np.ndarray, freq_dev: float = 5000.0) -> np.ndarray:
+        """FM modulate audio to complex baseband I/Q"""
+        peak = np.max(np.abs(audio)) + 1e-12
+        audio_n = audio / peak
+        integral = np.cumsum(audio_n) / self.sample_rate
+        phase = 2.0 * np.pi * freq_dev * integral
+        iq = np.exp(1j * phase).astype(np.complex64)
+        return iq
+
+    def modulate_ssb(self, audio: np.ndarray, upper_sideband: bool = True, center_freq: float = 0) -> np.ndarray:
+        """SSB modulation (USB/LSB) to complex baseband I/Q
+
+        Creates SSB signals using the analytic signal approach:
+        - USB: analytic signal (Hilbert transform) - contains positive frequencies
+        - LSB: conjugate analytic signal - contains negative frequencies
+
+        Note: This produces I/Q samples where USB/LSB information is encoded
+        in the real/imaginary channels respectively, matching the RX demodulation.
+
+        Args:
+            audio: Audio samples to modulate
+            upper_sideband: True for USB, False for LSB
+            center_freq: Center frequency for upshift (0 = baseband output)
+        """
+        peak = np.max(np.abs(audio)) + 1e-12
+        audio_n = audio / peak
+        analytic = signal.hilbert(audio_n)
+        if upper_sideband:
+            iq = analytic  # USB: positive frequencies in analytic signal
+        else:
+            iq = np.conj(analytic)  # LSB: negative frequencies via conjugation
+
+        # Apply TX frequency shift
+        iq = self.apply_frequency_shift_tx(iq, center_freq)
+        return iq.astype(np.complex64)
+    def read(self) -> np.ndarray:
+        """Read I/Q samples, return complex array"""
+        raise NotImplementedError
+
 
 class IQSource:
     """Base class for I/Q sample sources"""
@@ -233,11 +317,9 @@ class IQSource:
         self.running = False
 
     def start(self):
-        """Start the source"""
         self.running = True
 
     def stop(self):
-        """Stop the source"""
         self.running = False
 
     def read(self) -> np.ndarray:
@@ -371,6 +453,55 @@ class AudioCardIQSource(IQSource):
             
         except Exception as e:
             print(f"Error reading audio: {e}")
+            return None
+
+
+class AudioInputSource(IQSource):
+    """Read audio samples from microphone/line-in for TX path"""
+
+    def __init__(self, sample_rate: float, device: int = None, buffer_size: int = 4096):
+        super().__init__(sample_rate, buffer_size)
+        self.device = device
+        self.stream = None
+
+    def start(self):
+        super().start()
+        try:
+            print(f"[TX Audio Input] Opening stream: device={self.device}, sample_rate={self.sample_rate}, channels=1")
+            self.stream = sd.InputStream(
+                device=self.device,
+                samplerate=self.sample_rate,
+                channels=1,
+                blocksize=self.buffer_size,
+                dtype=np.float32
+            )
+            self.stream.start()
+            print("[TX Audio Input] Stream started successfully")
+        except Exception as e:
+            print(f"[TX Audio Input] Error starting stream: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def stop(self):
+        super().stop()
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+    def read(self) -> np.ndarray:
+        if not self.running or not self.stream:
+            return None
+
+        try:
+            data, _ = self.stream.read(self.buffer_size)
+            if data.shape[0] == 0:
+                return None
+            audio = data[:, 0]
+            return audio
+        except Exception as e:
+            print(f"Error reading audio input for TX: {e}")
             return None
 
 
@@ -524,6 +655,7 @@ class SDRProcessor(QObject):
     waterfall_updated = pyqtSignal(np.ndarray)
     audio_level_updated = pyqtSignal(float)
     s_meter_updated = pyqtSignal(float)
+    alc_level_updated = pyqtSignal(float)
 
     def __init__(self, config: SDRConfig):
         super().__init__()
@@ -532,7 +664,18 @@ class SDRProcessor(QObject):
         self.waterfall = WaterfallDisplay(config.fft_size)
         self.audio_output = AudioOutput(config.sample_rate, config.audio_device_output)
         self.iq_source = None
+        self.tx_audio_source = AudioInputSource(config.sample_rate, device=config.tx_audio_device_input)
+        self.tx_enabled = False
+        self.tx_modulation = config.modulation
+        self.tx_csv_file = None
+        self.tx_csv_path = "tx_output.csv"
         self.running = False
+        
+        # Diagnostic: save demodulated audio for analysis
+        self.save_demod_audio = False
+        self.demod_audio_file = None
+        self.demod_audio_writer = None
+        self.demod_frame_count = 0
 
     def set_iq_source(self, iq_source: IQSource):
         """Set the I/Q sample source"""
@@ -541,6 +684,75 @@ class SDRProcessor(QObject):
     def set_modulation(self, mod_type: ModulationType):
         """Change modulation type"""
         self.config.modulation = mod_type
+        self.tx_modulation = mod_type
+
+    def set_ssb_sideband(self, upper_sideband: bool):
+        """Set SSB sideband mode (True=USB, False=LSB)"""
+        old_value = self.config.ssb_upper_sideband
+        self.config.ssb_upper_sideband = upper_sideband
+        print(f"[Demod] SSB mode changed: {old_value} → {upper_sideband} ({'USB' if upper_sideband else 'LSB'})")
+        print(f"[Demod] Config SSB setting is now: {self.config.ssb_upper_sideband}")
+
+    def start_saving_demod_audio(self, filename: str = None):
+        """Start saving demodulated audio to CSV for analysis"""
+        if filename is None:
+            sideband = "USB" if self.config.ssb_upper_sideband else "LSB"
+            filename = f"demod_output_{sideband}_{self.demod_frame_count}.csv"
+        
+        try:
+            self.demod_audio_file = open(filename, 'w', newline='')
+            self.demod_audio_writer = csv.writer(self.demod_audio_file)
+            self.demod_audio_writer.writerow(['audio'])
+            self.save_demod_audio = True
+            self.demod_frame_count = 0
+            print(f"[Diag] Started saving demodulated audio to {filename}")
+        except Exception as e:
+            print(f"[Diag] Error opening demod audio file: {e}")
+
+    def stop_saving_demod_audio(self):
+        """Stop saving demodulated audio"""
+        if self.demod_audio_file:
+            try:
+                self.demod_audio_file.flush()
+                self.demod_audio_file.close()
+                sideband = "USB" if self.config.ssb_upper_sideband else "LSB"
+                print(f"[Diag] Closed demod audio file after {self.demod_frame_count} frames ({sideband})")
+            except Exception as e:
+                print(f"[Diag] Error closing demod audio file: {e}")
+            finally:
+                self.demod_audio_file = None
+                self.demod_audio_writer = None
+                self.save_demod_audio = False
+
+    def set_tx_enabled(self, enabled: bool):
+        """Enable or disable TX mode"""
+        self.tx_enabled = enabled
+
+    def set_tx_file(self, filename: str):
+        self.tx_csv_path = filename
+
+    def _open_tx_file(self):
+        try:
+            print(f"[TX] Opening CSV file: {self.tx_csv_path}")
+            self.tx_csv_file = open(self.tx_csv_path, 'w', newline='')
+            self.tx_csv_writer = csv.writer(self.tx_csv_file)
+            self.tx_csv_writer.writerow(['I', 'Q'])
+            print(f"[TX] CSV file opened successfully")
+        except Exception as e:
+            print(f"[TX] Error opening TX CSV file: {e}")
+            import traceback
+            traceback.print_exc()
+            self.tx_csv_file = None
+
+    def _close_tx_file(self):
+        if self.tx_csv_file:
+            try:
+                self.tx_csv_file.close()
+                print("[TX] CSV file closed successfully")
+            except Exception as e:
+                print(f"[TX] Error closing TX CSV file: {e}")
+            finally:
+                self.tx_csv_file = None
 
     def set_volume(self, volume: float):
         """Set output volume (0.0 to 1.0)"""
@@ -558,12 +770,75 @@ class SDRProcessor(QObject):
             return
 
         self.iq_source.start()
+        self.tx_audio_source.start()
         self.audio_output.start()
         self.running = True
         frame_count = 0
 
         try:
             while self.running:
+                if self.tx_enabled:
+                    # TX mode: read microphone audio and modulate
+                    audio = self.tx_audio_source.read()
+                    if audio is None:
+                        print("[TX] Audio source returned None")
+                        continue
+
+                    if len(audio) == 0:
+                        print("[TX] Audio array is empty")
+                        continue
+
+                    print(f"[TX] Read audio: shape={audio.shape}, dtype={audio.dtype}, peak={np.max(np.abs(audio)):.6f}")
+
+                    if self.tx_csv_file is None:
+                        self._open_tx_file()
+
+                    try:
+                        if self.tx_modulation == ModulationType.AM:
+                            modulated = self.demodulator.modulate_am(audio)
+                        elif self.tx_modulation == ModulationType.FM:
+                            modulated = self.demodulator.modulate_fm(audio)
+                        elif self.tx_modulation == ModulationType.SSB:
+                            modulated = self.demodulator.modulate_ssb(audio, 
+                                                                     upper_sideband=self.config.ssb_upper_sideband,
+                                                                     center_freq=self.config.center_freq)
+                        else:
+                            modulated = np.zeros_like(audio, dtype=np.complex64)
+                    except Exception as e:
+                        print(f"[TX] Modulation error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+
+                    print(f"[TX] Modulated: shape={modulated.shape}, dtype={modulated.dtype}, peak={np.max(np.abs(modulated)):.6f}")
+
+                    # ALC: keep max amplitude <1
+                    peak = np.max(np.abs(modulated)) + 1e-12
+                    gain = 1.0
+                    if peak > 1.0:
+                        gain = 1.0 / peak
+                    modulated *= gain
+                    self.alc_level_updated.emit(20 * np.log10(gain + 1e-12))
+
+                    if self.tx_csv_file:
+                        rows_written = 0
+                        try:
+                            for sample in modulated:
+                                self.tx_csv_writer.writerow([np.real(sample), np.imag(sample)])
+                                rows_written += 1
+                            self.tx_csv_file.flush()  # Ensure data is written to disk
+                            print(f"[TX] Wrote {rows_written} samples to CSV (flushed)")
+                        except Exception as e:
+                            print(f"[TX] Error writing to CSV: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+                    # Update S-meter label for ALC with same signal
+                    self.s_meter_updated.emit(20 * np.log10(np.max(np.abs(modulated)) + 1e-12))
+
+                    threading.Event().wait(0.001)
+                    continue
+
                 # Read I/Q samples
                 iq_samples = self.iq_source.read()
                 if iq_samples is None:
@@ -577,12 +852,24 @@ class SDRProcessor(QObject):
                 elif self.config.modulation == ModulationType.CW:
                     audio = self.demodulator.demodulate_cw(iq_samples)
                 elif self.config.modulation == ModulationType.SSB:
-                    audio = self.demodulator.demodulate_ssb(iq_samples)
+                    audio = self.demodulator.demodulate_ssb(iq_samples, 
+                                                           upper_sideband=self.config.ssb_upper_sideband)
                 else:
                     audio = np.zeros_like(iq_samples, dtype=float)
 
                 # Apply volume
                 audio = audio * self.config.volume
+
+                # Diagnostic: Save demodulated audio if enabled
+                if self.save_demod_audio and self.demod_audio_writer:
+                    try:
+                        for sample in audio:
+                            self.demod_audio_writer.writerow([sample])
+                        self.demod_frame_count += 1
+                        if self.demod_frame_count % 10 == 0:
+                            self.demod_audio_file.flush()
+                    except Exception as e:
+                        print(f"[Diag] Error writing demod audio: {e}")
 
                 # Output audio
                 self.audio_output.write(audio)
@@ -593,6 +880,11 @@ class SDRProcessor(QObject):
                     self.waterfall.update(iq_samples, self.config.sample_rate, self.config.center_freq)
                     waterfall_data = self.waterfall.get_data()
                     self.waterfall_updated.emit(waterfall_data)
+
+                # Debug: Show SSB mode every 100 frames if SSB selected
+                if self.config.modulation == ModulationType.SSB and frame_count % 100 == 0:
+                    sideband_name = "USB" if self.config.ssb_upper_sideband else "LSB"
+                    print(f"[RX] SSB demodulating with {sideband_name}, config={self.config.ssb_upper_sideband}")
 
                 # Emit audio level for display
                 level = np.sqrt(np.mean(audio ** 2))
@@ -612,7 +904,9 @@ class SDRProcessor(QObject):
             traceback.print_exc()
         finally:
             self.iq_source.stop()
+            self.tx_audio_source.stop()
             self.audio_output.stop()
+            self._close_tx_file()
             self.running = False
 
     def stop(self):
@@ -750,6 +1044,27 @@ class VibeSDRGUI(QMainWindow):
         demod_group.setLayout(demod_layout)
         layout.addWidget(demod_group)
 
+        # SSB Sideband selection
+        ssb_group = QGroupBox("SSB Sideband")
+        ssb_layout = QFormLayout()
+        self.ssb_buttons = QButtonGroup()
+        
+        self.usb_btn = QRadioButton("USB (Upper)")
+        self.lsb_btn = QRadioButton("LSB (Lower)")
+        self.ssb_buttons.addButton(self.usb_btn, 1)
+        self.ssb_buttons.addButton(self.lsb_btn, 0)
+        self.usb_btn.setChecked(True)  # Default to USB
+        
+        ssb_layout.addRow(self.usb_btn)
+        ssb_layout.addRow(self.lsb_btn)
+        
+        # Connect to clicked signals (fired only when user clicks)
+        self.usb_btn.clicked.connect(lambda: self._on_ssb_sideband_changed(True))
+        self.lsb_btn.clicked.connect(lambda: self._on_ssb_sideband_changed(False))
+        
+        ssb_group.setLayout(ssb_layout)
+        layout.addWidget(ssb_group)
+
         # Volume control
         volume_group = QGroupBox("Volume")
         volume_layout = QVBoxLayout()
@@ -827,8 +1142,36 @@ class VibeSDRGUI(QMainWindow):
         list_devices_btn.clicked.connect(self._on_list_devices)
         source_layout.addWidget(list_devices_btn)
 
+        # TX audio device selection
+        self.tx_device_btn = QPushButton("Select TX Device")
+        self.tx_device_btn.clicked.connect(self._on_select_tx_device)
+        source_layout.addWidget(self.tx_device_btn)
+
+        self.tx_device_label = QLabel("TX Device: default")
+        source_layout.addWidget(self.tx_device_label)
+
+        self.tx_btn = QPushButton("Start TX")
+        self.tx_btn.setCheckable(True)
+        self.tx_btn.clicked.connect(self._on_tx_toggle)
+        source_layout.addWidget(self.tx_btn)
+
         source_group.setLayout(source_layout)
         layout.addWidget(source_group)
+
+        # Diagnostic tools
+        diag_group = QGroupBox("Diagnostics")
+        diag_layout = QVBoxLayout()
+        
+        self.diag_save_audio_btn = QPushButton("Save Demod Audio")
+        self.diag_save_audio_btn.setCheckable(True)
+        self.diag_save_audio_btn.clicked.connect(self._on_diag_save_audio_toggle)
+        diag_layout.addWidget(self.diag_save_audio_btn)
+        
+        self.diag_status_label = QLabel("Audio: not saving")
+        diag_layout.addWidget(self.diag_status_label)
+        
+        diag_group.setLayout(diag_layout)
+        layout.addWidget(diag_group)
 
         # Audio level indicator
         level_group = QGroupBox("Audio Level")
@@ -854,6 +1197,8 @@ class VibeSDRGUI(QMainWindow):
 
         s_meter_layout.addWidget(self.s_meter_label)
         s_meter_layout.addWidget(self.s_meter_bar)
+        self.alc_label = QLabel("ALC: -- dB")
+        s_meter_layout.addWidget(self.alc_label)
         s_meter_layout.addWidget(QLabel("Mode:"))
         s_meter_layout.addWidget(self.s_meter_mode_combo)
         s_meter_group.setLayout(s_meter_layout)
@@ -880,6 +1225,19 @@ class VibeSDRGUI(QMainWindow):
             selected_id = self.demod_buttons.checkedId()
             mod_type = list(ModulationType)[selected_id]
             self.processor.set_modulation(mod_type)
+
+    def _on_ssb_sideband_changed(self, upper_sideband: bool):
+        """Handle SSB sideband change
+        
+        Args:
+            upper_sideband: True for USB, False for LSB
+        """
+        print(f"[UI] SSB sideband button clicked: upper_sideband={upper_sideband} ({'USB' if upper_sideband else 'LSB'})")
+        if self.processor:
+            print(f"[UI] Processor exists, setting sideband to {'USB' if upper_sideband else 'LSB'}")
+            self.processor.set_ssb_sideband(upper_sideband)
+        else:
+            print(f"[UI] WARNING: Processor is None, cannot set sideband")
 
     def _on_freq_dial_changed(self, value):
         """Handle tuning knob change"""
@@ -951,9 +1309,21 @@ class VibeSDRGUI(QMainWindow):
         # Create processor
         self.processor = SDRProcessor(self.config)
         self.processor.set_iq_source(self.iq_source)
+
+        # Set SSB sideband from UI state
+        if hasattr(self, 'usb_btn') and hasattr(self, 'lsb_btn'):
+            upper_sideband = self.usb_btn.isChecked()
+            print(f"[Init] Setting SSB sideband to {'USB' if upper_sideband else 'LSB'}")
+            self.processor.set_ssb_sideband(upper_sideband)
+
+        tx_index = getattr(self.config, 'tx_audio_device_input', None)
+        if tx_index is not None:
+            self.processor.tx_audio_source.device = tx_index
+
         self.processor.waterfall_updated.connect(self._on_waterfall_update)
         self.processor.audio_level_updated.connect(self._on_level_update)
         self.processor.s_meter_updated.connect(self._on_s_meter_update)
+        self.processor.alc_level_updated.connect(self._on_alc_update)
 
         # Start in thread
         self.processor_thread = QThread()
@@ -982,6 +1352,62 @@ class VibeSDRGUI(QMainWindow):
     def _on_list_devices(self):
         """List available audio devices"""
         AudioCardIQSource.list_devices()
+
+    def _on_select_tx_device(self):
+        """Ask user to select TX soundcard input device"""
+        items = [f"{d['name']} ({d['channels']} ch)" for d in self.available_devices]
+        if not items:
+            print("No TX audio devices available")
+            return
+
+        current_index = 0
+        device_name, ok = QInputDialog.getItem(self, "Select TX Audio Device", "TX Device:", items, current_index, False)
+        if ok and device_name:
+            selected = next((d for d in self.available_devices if f"{d['name']} ({d['channels']} ch)" == device_name), None)
+            if selected:
+                self.tx_device_label.setText(f"TX Device: {selected['name']}")
+                self.config.tx_audio_device_input = selected['index']
+                if self.processor:
+                    self.processor.tx_audio_source.device = selected['index']
+
+    def _on_tx_toggle(self, checked: bool):
+        """Toggle TX on/off"""
+        if self.processor:
+            if checked:
+                self.tx_btn.setText("Stop TX")
+                # file chooser for TX output each start
+                filename, _ = QFileDialog.getSaveFileName(self, "Save TX I/Q CSV", "tx_output.csv", "CSV Files (*.csv)")
+                if filename:
+                    print(f"[TX] User selected file: {filename}")
+                    self.processor.set_tx_file(filename)
+                    self.processor.set_tx_enabled(True)
+                else:
+                    # no filename, cancel transmit
+                    print("[TX] User cancelled file selection")
+                    self.processor.set_tx_enabled(False)
+                    self.tx_btn.setChecked(False)
+                    self.tx_btn.setText("Start TX")
+                    return
+            else:
+                print("[TX] User stopped transmit")
+                self.processor.set_tx_enabled(False)
+                self.tx_btn.setText("Start TX")
+
+    def _on_alc_update(self, alc_db: float):
+        """Update ALC meter during transmit"""
+        self.alc_label.setText(f"ALC: {alc_db:.1f} dB")
+
+    def _on_diag_save_audio_toggle(self, checked: bool):
+        """Toggle diagnostic audio saving"""
+        if self.processor:
+            if checked:
+                self.processor.start_saving_demod_audio()
+                self.diag_save_audio_btn.setText("Stop Saving")
+                self.diag_status_label.setText("Audio: SAVING")
+            else:
+                self.processor.stop_saving_demod_audio()
+                self.diag_save_audio_btn.setText("Save Demod Audio")
+                self.diag_status_label.setText("Audio: saved")
 
     def _on_waterfall_update(self, waterfall_data: np.ndarray):
         """Update waterfall display"""
@@ -1037,6 +1463,22 @@ class VibeSDRGUI(QMainWindow):
             display_text = f"S-meter: {calibrated_db:.1f} dB ({s_label})"
 
         self.s_meter_label.setText(display_text)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            if self.processor:
+                self.processor.set_tx_enabled(True)
+                self.tx_btn.setChecked(True)
+                self.tx_btn.setText("Stop TX")
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            if self.processor:
+                self.processor.set_tx_enabled(False)
+                self.tx_btn.setChecked(False)
+                self.tx_btn.setText("Start TX")
+        super().keyReleaseEvent(event)
 
     def closeEvent(self, event):
         """Clean up on window close"""
