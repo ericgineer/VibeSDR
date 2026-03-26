@@ -1,0 +1,14 @@
+Today we are creating a software application in Python called CoolSDR.
+
+CoolSDR is a software defined radio application that takes in-phase and quadrature (I/Q) samples
+from either the sound card input or from a csv file of IQ samples (for debug). CoolSDR will then demodulate
+the IQ samples and output the demodulated audio through the souncard output. CoolSDR can decode
+AM, FM, CW, and SSB. CoolSDR will also display a waterfall display showing the frequency spectrum
+of the received IQ samples over time.
+
+Implement all the neccessary algorithms to demodulate AM, FM, CW, and SSB from received IQ samples
+from the soundcard or from a CSV file of IQ samples.
+
+The GUI of CoolSDR will include a waterfall display that shows the frequency spectrum of the received
+IQ samples over time, a tuning knob to change the frequency, radio buttons to select between AM, FM, CW,
+and SSB, and a slider to control the volume of the demodulated audio.
