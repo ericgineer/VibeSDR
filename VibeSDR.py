@@ -225,39 +225,42 @@ class Demodulator:
 
     def demodulate_ssb(self, iq_samples: np.ndarray, upper_sideband: bool = True) -> np.ndarray:
         """
-        Demodulate SSB (Single SideBand) signal
+        Demodulate SSB (Single SideBand) signal using block-diagram phasing method.
 
-        NOTE: This implementation is tailored to the specific I/Q sample format
-        used in this SDR application. For this format:
-        - USB information is encoded in the real (I) channel
-        - LSB information is encoded in the imaginary (Q) channel
-
-        This is NOT standard SSB demodulation theory, but works empirically
-        for the test signals and I/Q data format used here.
-
-        Args:
-            iq_samples: Complex I/Q samples
-            upper_sideband: True for USB, False for LSB
+        Steps:
+          1. Frequency shift to center (tune)
+          2. Use I/Q branches (mixer outputs)
+          3. LPF each branch after the mixer
+          4. Hilbert (–90°) on Q branch
+          5. Combine for USB/LSB and LPF output
         """
-        # Apply frequency shift for tuning (heterodyne to baseband)
+        # 1) Tune
         iq_samples = self.apply_frequency_shift(iq_samples)
 
-        # Extract audio based on sideband selection for this I/Q format
+        # 2) I/Q mixer outputs
+        i_branch = np.real(iq_samples)
+        q_branch = np.imag(iq_samples)
+
+        # 3) LPF each branch to remove high-frequency mixer products
+        i_lp = signal.lfilter(self.demod_filter[0], self.demod_filter[1], i_branch)
+        q_lp = signal.lfilter(self.demod_filter[0], self.demod_filter[1], q_branch)
+
+        # 4) Apply Hilbert (–90° phase shift) to Q branch
+        q_hilbert = np.imag(signal.hilbert(q_lp))
+
+        # 5) Combine for USB/LSB per diagram
+        # USB from test file should be active when USB selected;
+        # LSB should be active when LSB selected.
         if upper_sideband:
-            audio = np.real(iq_samples)  # USB: I channel
+            audio = i_lp - q_hilbert    # USB
         else:
-            audio = np.imag(iq_samples)  # LSB: Q channel
+            audio = i_lp + q_hilbert    # LSB
 
-        # Remove DC bias
+        # DC removal and final audio LPF
         audio = audio - np.mean(audio)
-
-        # Apply low-pass filter to remove high-frequency artifacts
         audio = signal.lfilter(self.demod_filter[0], self.demod_filter[1], audio)
 
         return audio
-
-        # Apply final audio low-pass filter
-        audio = signal.lfilter(self.demod_filter[0], self.demod_filter[1], audio)
 
     def modulate_am(self, audio: np.ndarray) -> np.ndarray:
         """AM modulate audio to complex baseband I/Q"""
@@ -278,30 +281,25 @@ class Demodulator:
         return iq
 
     def modulate_ssb(self, audio: np.ndarray, upper_sideband: bool = True, center_freq: float = 0) -> np.ndarray:
-        """SSB modulation (USB/LSB) to complex baseband I/Q
-
-        Creates SSB signals using the analytic signal approach:
-        - USB: analytic signal (Hilbert transform) - contains positive frequencies
-        - LSB: conjugate analytic signal - contains negative frequencies
-
-        Note: This produces I/Q samples where USB/LSB information is encoded
-        in the real/imaginary channels respectively, matching the RX demodulation.
-
-        Args:
-            audio: Audio samples to modulate
-            upper_sideband: True for USB, False for LSB
-            center_freq: Center frequency for upshift (0 = baseband output)
-        """
+        """SSB modulation (USB/LSB) to complex baseband I/Q using phasing method."""
+        # Normalize audio quickly (preserve original amplitude shape)
         peak = np.max(np.abs(audio)) + 1e-12
         audio_n = audio / peak
-        analytic = signal.hilbert(audio_n)
-        if upper_sideband:
-            iq = analytic  # USB: positive frequencies in analytic signal
-        else:
-            iq = np.conj(analytic)  # LSB: negative frequencies via conjugation
 
-        # Apply TX frequency shift
+        # Hilbert-transform for phasing
+        audio_h = np.imag(signal.hilbert(audio_n))
+
+        # Phasing method: build I/Q from audio and Hilbert audio
+        # USB: I=0.5*x, Q=+0.5*x_h
+        # LSB: I=0.5*x, Q=-0.5*x_h
+        i_branch = 0.5 * audio_n
+        q_branch = (0.5 if upper_sideband else -0.5) * audio_h
+
+        iq = i_branch + 1j * q_branch
+
+        # Apply TX frequency shift to center frequency
         iq = self.apply_frequency_shift_tx(iq, center_freq)
+
         return iq.astype(np.complex64)
     def read(self) -> np.ndarray:
         """Read I/Q samples, return complex array"""
